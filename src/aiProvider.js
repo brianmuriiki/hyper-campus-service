@@ -1,9 +1,12 @@
 import 'dotenv/config'
 
-// Every provider implements the same shape: an async generator yielding text chunks.
-// Swap which one runs via the PROVIDER env var — no other code needs to change.
+// Some free models (notably certain Nemotron variants) prepend a raw safety
+// classifier verdict directly into the visible content, e.g.:
+//   "User Safety: safe\nResponse Safety: safe\n\n<actual answer>"
+// OpenRouter doesn't strip this for us, so we filter it out of the stream.
+const SAFETY_PREAMBLE_PATTERN = /^(User Safety:\s*\w+\s*\n)(Response Safety:\s*\w+\s*\n)?\n*/i
 
-async function* openRouterProvider(systemPrompt, messages, model) {
+async function* callOpenRouter(systemPrompt, messages, model, signal) {
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -13,17 +16,18 @@ async function* openRouterProvider(systemPrompt, messages, model) {
       'X-Title': 'HYPER-CAMPUS',
     },
     body: JSON.stringify({
-      model: model || process.env.OPENROUTER_MODEL || 'openrouter/free',
+      model,
       messages: [{ role: 'system', content: systemPrompt }, ...messages],
       stream: true,
     }),
+    signal,
   })
 
-  console.log('OpenRouter response status:', response.status, response.ok)
   if (!response.ok) {
-    const errText = await response.text()
-    console.log('OpenRouter error body:', errText)
-    return
+    const errBody = await response.text().catch(() => '')
+    const err = new Error(`OpenRouter ${response.status} for model "${model}": ${errBody}`)
+    err.status = response.status
+    throw err
   }
 
   const reader = response.body.getReader()
@@ -49,6 +53,57 @@ async function* openRouterProvider(systemPrompt, messages, model) {
         // ignore malformed SSE lines
       }
     }
+  }
+}
+
+// Wraps any provider's raw token stream and strips a leading safety-classifier
+// preamble, if present, before anything reaches the client. Buffers just enough
+// of the start of the response to check — everything after that streams through untouched.
+async function* stripSafetyPreamble(tokenStream) {
+  let checkBuffer = ''
+  let checked = false
+
+  for await (const token of tokenStream) {
+    if (checked) {
+      yield token
+      continue
+    }
+
+    checkBuffer += token
+
+    // Wait for enough text to confidently check, or a clear break in the pattern
+    if (checkBuffer.length < 60 && !checkBuffer.includes('\n\n')) continue
+
+    const match = checkBuffer.match(SAFETY_PREAMBLE_PATTERN)
+    checked = true
+    if (match) {
+      const stripped = checkBuffer.slice(match[0].length)
+      if (stripped) yield stripped
+    } else {
+      yield checkBuffer
+    }
+  }
+
+  // Handle the case where the whole response was shorter than the check threshold
+  if (!checked && checkBuffer) {
+    const match = checkBuffer.match(SAFETY_PREAMBLE_PATTERN)
+    yield match ? checkBuffer.slice(match[0].length) : checkBuffer
+  }
+}
+
+async function* openRouterProvider(systemPrompt, messages, model, signal) {
+  const requested = model || process.env.OPENROUTER_MODEL || 'openrouter/free'
+
+  try {
+    yield* stripSafetyPreamble(callOpenRouter(systemPrompt, messages, requested, signal))
+  } catch (err) {
+    if (err.name === 'AbortError') throw err
+
+    const isRecoverable = err.status === 400 || err.status === 429
+    if (!isRecoverable || requested === 'openrouter/free') throw err
+
+    console.log(`"${requested}" failed (${err.status}), silently falling back to Auto`)
+    yield* stripSafetyPreamble(callOpenRouter(systemPrompt, messages, 'openrouter/free', signal))
   }
 }
 
