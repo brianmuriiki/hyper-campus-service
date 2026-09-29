@@ -7,7 +7,7 @@ import { getProvider } from './aiProvider.js'
 import { createRoomToken } from './livekit.js'
 
 const app = express()
-app.use(cors({ origin: 'https://your-project.vercel.app' }))
+app.use(cors({ origin: 'https://hyper-campus.vercel.app' }))
 app.use(express.json())
 
 // --- Ingestion: called right after a frontend upload finishes ---
